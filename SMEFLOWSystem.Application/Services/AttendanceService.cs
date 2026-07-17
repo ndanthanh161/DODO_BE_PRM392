@@ -1,0 +1,787 @@
+using Microsoft.Extensions.Logging;
+using ShareKernel.Common.Enum;
+using SMEFLOWSystem.Application.DTOs;
+using SMEFLOWSystem.Application.DTOs.AttendanceDtos;
+using SMEFLOWSystem.Application.Extensions;
+using SMEFLOWSystem.Application.Helpers;
+using SMEFLOWSystem.Application.Interfaces.IRepositories;
+using SMEFLOWSystem.Application.Interfaces.IServices;
+using SMEFLOWSystem.Core.Entities;
+using SMEFLOWSystem.SharedKernel.Interfaces;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace SMEFLOWSystem.Application.Services
+{
+    public class AttendanceService : IAttendanceService
+    {
+        private readonly IRawPunchLogRepository _punchLogRepo;
+        private readonly IEmployeeRepository _employeeRepository;
+        private readonly IDailyTimesheetRepository _dailyTimesheetRepository;
+        private readonly IAttendanceSettingRepository _attendanceSettingRepository;
+        private readonly ICurrentTenantService _currentTenantService;
+        private readonly ITimesheetAppealRepository _appealRepository;
+        private readonly ICloudinaryService _cloudinary;
+        private readonly ITransaction _transaction;
+        private readonly IPublicHolidayRepository _publicHolidayRepository;
+        private readonly IRealtimeNotificationService _realtime;
+        private readonly ILogger<AttendanceService> _logger;
+        private readonly IHrAuthorizationService _hrAuth;
+        private readonly ICurrentUserService _currentUser;
+
+        private static readonly TimeZoneInfo VietnamTimeZone = GetVietnamTimeZone();
+
+        private static TimeZoneInfo GetVietnamTimeZone()
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time"); }
+            catch { /* Windows không có */ }
+            try { return TimeZoneInfo.FindSystemTimeZoneById("Asia/Ho_Chi_Minh"); }
+            catch { /* Linux không có */ }
+            return TimeZoneInfo.CreateCustomTimeZone("VN", TimeSpan.FromHours(7), "Vietnam", "Vietnam Standard Time");
+        }
+
+        public AttendanceService(
+            IRawPunchLogRepository punchLogRepo, 
+            IEmployeeRepository employeeRepository,
+            IDailyTimesheetRepository dailyTimesheetRepository,
+            IAttendanceSettingRepository attendanceSettingRepository,
+            ICurrentTenantService currentTenantService,
+            ITimesheetAppealRepository appealRepository,
+            ICloudinaryService cloudinary,
+            ITransaction transaction,
+            IPublicHolidayRepository publicHolidayRepository,
+            IRealtimeNotificationService realtime,
+            ILogger<AttendanceService> logger,
+            IHrAuthorizationService hrAuth,
+            ICurrentUserService currentUser)
+        {
+            _punchLogRepo = punchLogRepo;
+            _employeeRepository = employeeRepository;
+            _dailyTimesheetRepository = dailyTimesheetRepository;
+            _attendanceSettingRepository = attendanceSettingRepository;
+            _currentTenantService = currentTenantService;
+            _appealRepository = appealRepository;
+            _cloudinary = cloudinary;
+            _transaction = transaction;
+            _publicHolidayRepository = publicHolidayRepository;
+            _realtime = realtime;
+            _logger = logger;
+            _hrAuth = hrAuth;
+            _currentUser = currentUser;
+        }
+
+        public async Task<RawPunchLogDto> SubmitPunchAsync(Guid userId, SubmitPunchRequestDto request)
+        {
+            var employee = await _employeeRepository.GetByUserIdAsync(userId);
+            if (employee == null)
+            {
+                throw new InvalidOperationException("Employee not found for current user.");
+            }
+
+            if (request.IsMockLocation)
+            {
+                throw new InvalidOperationException("FakeGPS: Phát hiện sử dụng phần mềm giả mạo vị trí. Vui lòng tắt Fake GPS!");
+            }
+
+            var tenantId = _currentTenantService.TenantId ?? employee.TenantId;
+            var attendanceSetting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId);
+
+            // Geofencing Validation
+            if (attendanceSetting != null && attendanceSetting.Latitude.HasValue && attendanceSetting.Longitude.HasValue)
+            {
+                if (!request.Latitude.HasValue || !request.Longitude.HasValue)
+                {
+                    throw new InvalidOperationException("BatBuocGPS: Vui lòng bật định vị GPS để chấm công.");
+                }
+
+                var distance = GeoHelper.DistanceInMeters(
+                    request.Latitude.Value, request.Longitude.Value,
+                    attendanceSetting.Latitude.Value, attendanceSetting.Longitude.Value);
+
+                if (distance > attendanceSetting.CheckInRadiusMeters)
+                {
+                    throw new InvalidOperationException($"NgoaiVung: Bạn đang ở ngoài vùng chấm công cho phép (Cách {Math.Round(distance)}m). Bán kính cho phép là {attendanceSetting.CheckInRadiusMeters}m.");
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(request.SelfieUrl) && !string.IsNullOrWhiteSpace(request.SelfieBase64))
+            {
+                request.SelfieUrl = await _cloudinary.UploadBase64Async(request.SelfieBase64, "attendance/selfies");
+            }
+
+            var punch = new RawPunchLog()
+            {
+                EmployeeId = employee.Id,
+                Timestamp = DateTime.UtcNow,
+                DeviceId = request.DeviceId,
+                PunchType = request.PunchType ?? "Auto",
+                Latitude = request.Latitude,
+                Longitude = request.Longitude,
+                SelfieUrl = request.SelfieUrl,
+                IsProcessed = false 
+            };
+
+            await _punchLogRepo.AddAsync(punch);
+
+            if (employee.UserId != null)
+            {
+                _ = _realtime.NotifyPunchReceivedAsync(
+                        employee.UserId.Value,
+                        new
+                        {
+                            received = true,
+                            punchType = punch.PunchType,
+                            timestamp = punch.Timestamp,
+                            message = "Đã ghi nhận chấm công, đang chờ xử lý..."
+                        })
+                    .ContinueWith(t =>
+                    {
+                        if (t.IsFaulted)
+                            _logger.LogWarning(t.Exception, "Notify punch.received failed for employee {EmployeeId}", employee.Id);
+                    });
+            }
+
+            return new RawPunchLogDto
+            {
+                Id = punch.Id,
+                EmployeeId = punch.EmployeeId,
+                Timestamp = punch.Timestamp,
+                DeviceId = punch.DeviceId,
+                IsProcessed = punch.IsProcessed,
+                PunchType = punch.PunchType
+            };
+        }
+
+        public async Task<TodayAttendanceDto> GetMyTodayStatusAsync(Guid userId)
+        {
+            var employee = await _employeeRepository.GetByUserIdAsync(userId);
+            if (employee == null)
+            {
+                throw new InvalidOperationException("Employee not found for current user.");
+            }
+
+            var tenantId = _currentTenantService.TenantId ?? employee.TenantId;
+            var attendanceSetting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId);
+            
+            var localTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, VietnamTimeZone);
+            var cutOffTime = attendanceSetting?.DayStartCutOffTime ?? new TimeSpan(4, 0, 0);
+            
+            var workDate = localTime.TimeOfDay < cutOffTime
+                ? DateOnly.FromDateTime(localTime.AddDays(-1))
+                : DateOnly.FromDateTime(localTime);
+
+            var timesheet = await _dailyTimesheetRepository.GetByEmployeeDateAsync(employee.Id, workDate);
+            
+            var result = new TodayAttendanceDto
+            {
+                HasCheckedIn = false,
+                HasCheckedOut = false
+            };
+
+            if (timesheet != null && timesheet.Segments.Any())
+            {
+                var firstSegment = timesheet.Segments.OrderBy(s => s.ActualCheckIn).FirstOrDefault(s => s.ActualCheckIn.HasValue);
+                var lastSegment = timesheet.Segments.OrderByDescending(s => s.ActualCheckOut).FirstOrDefault();
+
+                if (firstSegment?.ActualCheckIn != null)
+                {
+                    result.HasCheckedIn = true;
+                    result.CheckInTime = firstSegment.ActualCheckIn;
+                    result.CheckInSelfieUrl = firstSegment.CheckInSelfieUrl;
+                }
+
+                if (lastSegment?.ActualCheckOut != null)
+                {
+                    result.HasCheckedOut = true;
+                    result.CheckOutTime = lastSegment.ActualCheckOut;
+                }
+
+                result.LateMinutes = timesheet.TotalLateMinutes;
+                result.EarlyLeaveMinutes = timesheet.TotalEarlyLeaveMinutes;
+                result.ActualWorkHours = timesheet.ActualWorkHours;
+                result.OTHours = timesheet.OTHours;
+                result.Status = string.IsNullOrEmpty(timesheet.Status) ? StatusEnum.AttendancePresent : timesheet.Status;
+            }
+            else
+            {
+                var localDayStart = workDate.ToDateTime(TimeOnly.FromTimeSpan(cutOffTime));
+                var fromDateUtc = TimeZoneInfo.ConvertTimeToUtc(localDayStart, VietnamTimeZone);
+                var toDateUtc = fromDateUtc.AddDays(1);
+
+                var rawLogs = await _punchLogRepo.GetByEmployeeAndDateRangeAsync(employee.Id, fromDateUtc, toDateUtc);
+                if(rawLogs.Any())
+                {
+                    var ordered = rawLogs.OrderBy(x => x.Timestamp).ToList();
+
+                    result.HasCheckedIn = true;
+                    result.CheckInTime = ordered.First().Timestamp;
+                    result.CheckInSelfieUrl = ordered.First().SelfieUrl;
+
+                    if(ordered.Count > 1)
+                    {
+                        result.HasCheckedOut = true;
+                        result.CheckOutTime = ordered.Last().Timestamp;
+                    } 
+                        
+                }
+            }
+
+            return result;
+        }
+
+        public async Task<List<MyAttendanceHistoryItemDto>> GetMyHistoryAsync(Guid userId, int month, int year)
+        {
+            var employee = await _employeeRepository.GetByUserIdAsync(userId);
+            if (employee == null)
+            {
+                throw new InvalidOperationException("Employee not found for current user.");
+            }
+
+            var timesheets = await _dailyTimesheetRepository.GetByEmployeeMonthAsync(employee.Id, month, year);
+            var results = new List<MyAttendanceHistoryItemDto>();
+
+            foreach(var ts in timesheets)
+            {
+                var dto = new MyAttendanceHistoryItemDto
+                {
+                    WorkDate = ts.WorkDate,
+                    StandardWorkingHours = ts.StandardWorkingHours,
+                    TotalActualWorkedMinutes = ts.TotalActualWorkedMinutes,
+                    TotalLateMinutes = ts.TotalLateMinutes,
+                    TotalEarlyLeaveMinutes = ts.TotalEarlyLeaveMinutes,
+                    Status = ts.Status,
+                    ActualWorkHours = ts.ActualWorkHours,
+                    OTHours = ts.OTHours,
+                    SystemAnomalyFlag = ts.SystemAnomalyFlag,
+                    IsManuallyAdjusted = ts.IsManuallyAdjusted,
+                    Segments = ts.Segments.Select(s => new MyAttendanceSegmentDto
+                    {
+                        ActualCheckIn = s.ActualCheckIn,
+                        ActualCheckOut = s.ActualCheckOut,
+                        LateMinutes = s.LateMinutes,
+                        EarlyLeaveMinutes = s.EarlyLeaveMinutes,
+                        Status = s.Status
+                    }).ToList()
+                };
+                results.Add(dto);
+            }
+
+            return results;
+        }
+
+        public async Task<RawPunchLogDto> ManualPunchAsync(ManualPunchRequestDto request)
+        {
+            var employee = await _employeeRepository.GetByIdAsync(request.EmployeeId);
+            if (employee == null)
+                throw new InvalidOperationException("Employee not found.");
+
+            if (!_currentUser.IsAdmin() && !_currentUser.IsHrManager())
+            {
+                await _hrAuth.EnsureEmployeeAccessAsync(employee);
+            }
+
+            var punch = new RawPunchLog()
+            {
+                EmployeeId = request.EmployeeId,
+                Timestamp = request.Timestamp, // Giờ UTC mà HR chọn
+                DeviceId = "HR_Manual", // Đánh dấu đây là log do HR thêm tay để phân quyền audit
+                PunchType = request.PunchType,
+                IsProcessed = false,
+                Latitude = null,
+                Longitude = null,
+            };
+
+            await _punchLogRepo.AddAsync(punch);
+
+            // Emit realtime notification
+            var hrName = "HR Manager";
+            if (_currentUser.UserId.HasValue)
+            {
+                var hrEmp = await _employeeRepository.GetByUserIdAsync(_currentUser.UserId.Value);
+                if (hrEmp != null)
+                {
+                    hrName = hrEmp.FullName;
+                }
+            }
+
+            if (employee.UserId != null)
+            {
+                var localTime = TimeZoneInfo.ConvertTimeFromUtc(punch.Timestamp, VietnamTimeZone);
+                var manualPunchDto = new
+                {
+                    workDate = localTime.ToString("yyyy-MM-dd"),
+                    punchType = punch.PunchType,
+                    timestamp = punch.Timestamp,
+                    adjustedBy = hrName,
+                    note = request.Reason
+                };
+
+                _ = _realtime.NotifyAttendanceManualAdjustedAsync(employee.UserId.Value, manualPunchDto)
+                    .ContinueWith(t =>
+                    {
+                        if (t.IsFaulted)
+                            _logger.LogWarning(t.Exception, "Notify attendance.manual_adjusted failed for employee {UserId}", employee.UserId.Value);
+                    });
+            }
+
+            return new RawPunchLogDto
+            {
+                Id = punch.Id,
+                EmployeeId = punch.EmployeeId,
+                Timestamp = punch.Timestamp,
+                DeviceId = punch.DeviceId,
+                IsProcessed = punch.IsProcessed,
+                PunchType = punch.PunchType
+            };
+        }
+
+        public async Task RecalculateAttendanceAsync(Guid employeeId, DateOnly fromDate, DateOnly toDate)
+        {
+            var employee = await _employeeRepository.GetByIdAsync(employeeId) ?? throw new KeyNotFoundException("Employee not found");
+            if (!_currentUser.IsAdmin() && !_currentUser.IsHrManager())
+            {
+                await _hrAuth.EnsureEmployeeAccessAsync(employee);
+            }
+
+            var tenantId = _currentTenantService.TenantId ?? throw new UnauthorizedAccessException("Tenant ID is missing.");
+            var setting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId);
+            var cutOffTime = setting?.DayStartCutOffTime ?? new TimeSpan(4, 0, 0);
+
+            var utcFrom = TimeZoneInfo.ConvertTimeToUtc(fromDate.ToDateTime(TimeOnly.FromTimeSpan(cutOffTime)), VietnamTimeZone);
+            var utcTo = TimeZoneInfo.ConvertTimeToUtc(toDate.ToDateTime(TimeOnly.FromTimeSpan(cutOffTime)), VietnamTimeZone).AddDays(1);
+
+            // Set IsProcessed = false cho toàn bộ log trong dải thời gian này để Background job chạy lại
+            await _punchLogRepo.MarkUnprocessedForRecalculateAsync(employeeId, utcFrom, utcTo);
+        }
+        public async Task<TimesheetAppealDto> SubmitAppealAsync(Guid userId, SubmitAppealRequestDto request)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var employee = await _employeeRepository.GetByUserIdAsync(userId);
+            if (employee == null) throw new Exception("Employee not found");
+
+            // GAP-05: Validation ngày giải trình
+            var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, VietnamTimeZone));
+            if (request.WorkDate > today) 
+                throw new InvalidOperationException("Không thể giải trình cho ngày tương lai.");
+            if (today.DayNumber - request.WorkDate.DayNumber > 30) 
+                throw new InvalidOperationException("Không thể giải trình cho ngày quá hạn 30 ngày.");
+
+            // GAP-04: Tránh trùng đơn đang chờ duyệt
+            var existingPending = await _appealRepository.GetPendingByEmployeeDateAsync(employee.Id, request.WorkDate);
+            if (existingPending != null) 
+                throw new InvalidOperationException("Đã có đơn giải trình đang chờ duyệt cho ngày này.");
+
+            var appeal = new TimesheetAppeal
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId.Value,
+                EmployeeId = employee.Id,
+                WorkDate = request.WorkDate,
+                AppealType = request.AppealType,
+                RequestedCheckIn = request.RequestedCheckIn,
+                RequestedCheckOut = request.RequestedCheckOut,
+                Reason = request.Reason,
+                AttachmentUrl = request.AttachmentUrl,
+                Status = "PendingApproval"
+            };
+
+            await _appealRepository.AddAsync(appeal);
+
+            // Emit realtime notification
+            var appealDto = new
+            {
+                appealId = appeal.Id,
+                employeeId = appeal.EmployeeId,
+                employeeName = employee.FullName,
+                workDate = appeal.WorkDate.ToString("yyyy-MM-dd"),
+                appealType = appeal.AppealType,
+                reason = appeal.Reason,
+                submittedAt = DateTime.UtcNow
+            };
+
+            _ = _realtime.NotifyAppealSubmittedAsync(tenantId.Value, appealDto)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                        _logger.LogWarning(t.Exception, "Notify appeal.submitted failed for tenant {TenantId}", tenantId.Value);
+                });
+
+            return new TimesheetAppealDto
+            {
+                Id = appeal.Id,
+                EmployeeId = appeal.EmployeeId,
+                WorkDate = appeal.WorkDate,
+                AppealType = appeal.AppealType,
+                RequestedCheckIn = appeal.RequestedCheckIn,
+                RequestedCheckOut = appeal.RequestedCheckOut,
+                Reason = appeal.Reason,
+                AttachmentUrl = appeal.AttachmentUrl,
+                Status = appeal.Status,
+                ApprovedAt = appeal.ApprovedAt,
+                RejectReason = appeal.RejectReason
+            };
+        }
+
+        public async Task<List<TimesheetAppealDto>> GetMyAppealsAsync(Guid userId)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var employee = await _employeeRepository.GetByUserIdAsync(userId);
+            if (employee == null) return new List<TimesheetAppealDto>();
+
+            var appeals = await _appealRepository.GetByEmployeeAsync(employee.Id);
+            // Optionally, we could verify they belong to current tenant just to be safe
+            appeals = appeals.Where(a => a.TenantId == tenantId.Value).ToList();
+            
+            return appeals.Select(appeal => new TimesheetAppealDto
+            {
+                Id = appeal.Id,
+                EmployeeId = appeal.EmployeeId,
+                WorkDate = appeal.WorkDate,
+                AppealType = appeal.AppealType,
+                RequestedCheckIn = appeal.RequestedCheckIn,
+                RequestedCheckOut = appeal.RequestedCheckOut,
+                Reason = appeal.Reason,
+                AttachmentUrl = appeal.AttachmentUrl,
+                Status = appeal.Status,
+                ApprovedAt = appeal.ApprovedAt,
+                RejectReason = appeal.RejectReason
+            }).OrderByDescending(x => x.WorkDate).ToList();
+        }
+
+        public async Task<TimesheetAppealDto> ProcessAppealAsync(Guid hrUserId, Guid appealId, ApproveAppealRequestDto request)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var appeal = await _appealRepository.GetByIdAsync(appealId);
+            if (appeal == null || appeal.TenantId != tenantId.Value)
+                throw new Exception("Appeal not found");
+
+            if (!_currentUser.IsAdmin() && !_currentUser.IsHrManager())
+            {
+                var targetEmployee = await _employeeRepository.GetByIdAsync(appeal.EmployeeId) ?? throw new KeyNotFoundException("Employee not found");
+                await _hrAuth.EnsureEmployeeAccessAsync(targetEmployee);
+            }
+
+            if (appeal.Status != "PendingApproval")
+                throw new Exception("This appeal has already been processed.");
+
+            var hrUser = await _employeeRepository.GetByUserIdAsync(hrUserId);
+            if (hrUser == null && !_currentUser.IsAdmin()) 
+                throw new Exception("HR Employee record not found.");
+
+            var setting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId.Value);
+            var cutOffTime = setting?.DayStartCutOffTime ?? new TimeSpan(4, 0, 0);
+
+            await _transaction.ExecuteAsync(async () =>
+            {
+                if (request.IsApproved)
+                {
+                    appeal.Status = "Approved";
+                    appeal.ApprovedBy = hrUser?.Id ?? hrUserId;
+                    appeal.ApprovedAt = DateTime.UtcNow;
+                    await _appealRepository.UpdateAsync(appeal);
+
+                    // Create HR_Manual punches
+                    if (appeal.AppealType == "In" || appeal.AppealType == "Both")
+                    {
+                        if (appeal.RequestedCheckIn.HasValue)
+                        {
+                            await _punchLogRepo.AddAsync(new RawPunchLog
+                            {
+                                Id = Guid.NewGuid(),
+                                TenantId = tenantId.Value,
+                                EmployeeId = appeal.EmployeeId,
+                                Timestamp = appeal.RequestedCheckIn.Value,
+                                PunchType = "In",
+                                DeviceId = "HR_Manual",
+                                IsProcessed = false
+                            });
+                        }
+                    }
+
+                    if (appeal.AppealType == "Out" || appeal.AppealType == "Both")
+                    {
+                        if (appeal.RequestedCheckOut.HasValue)
+                        {
+                            await _punchLogRepo.AddAsync(new RawPunchLog
+                            {
+                                Id = Guid.NewGuid(),
+                                TenantId = tenantId.Value,
+                                EmployeeId = appeal.EmployeeId,
+                                Timestamp = appeal.RequestedCheckOut.Value,
+                                PunchType = "Out",
+                                DeviceId = "HR_Manual",
+                                IsProcessed = false
+                            });
+                        }
+                    }
+
+                    // GAP-02: Reset IsManuallyAdjusted to false on daily timesheet
+                    var existingTimesheet = await _dailyTimesheetRepository.GetByEmployeeDateAsync(
+                        appeal.EmployeeId, appeal.WorkDate);
+                    if (existingTimesheet != null && existingTimesheet.IsManuallyAdjusted)
+                    {
+                        existingTimesheet.IsManuallyAdjusted = false;
+                        await _dailyTimesheetRepository.UpdateAsync(existingTimesheet);
+                    }
+
+                    // BUG-05: Force recalculation for that day with accurate UTC times
+                    var utcFrom = TimeZoneInfo.ConvertTimeToUtc(appeal.WorkDate.ToDateTime(TimeOnly.FromTimeSpan(cutOffTime)), VietnamTimeZone);
+                    var utcTo = utcFrom.AddDays(1);
+
+                    await _punchLogRepo.MarkUnprocessedForRecalculateAsync(appeal.EmployeeId, utcFrom, utcTo);
+                }
+                else
+                {
+                    appeal.Status = "Rejected";
+                    appeal.ApprovedBy = hrUser?.Id ?? hrUserId;
+                    appeal.ApprovedAt = DateTime.UtcNow;
+                    appeal.RejectReason = request.RejectReason;
+                    await _appealRepository.UpdateAsync(appeal);
+                }
+
+            });
+
+            // Emit realtime notification
+            var employee = await _employeeRepository.GetByIdAsync(appeal.EmployeeId);
+            if (employee?.UserId != null)
+            {
+                var appealDto = new
+                {
+                    appealId = appeal.Id,
+                    workDate = appeal.WorkDate.ToString("yyyy-MM-dd"),
+                    status = appeal.Status,               // "Approved" hoặc "Rejected"
+                    rejectReason = appeal.RejectReason,   // null nếu Approved
+                    processedAt = DateTime.UtcNow
+                };
+
+                _ = _realtime.NotifyAppealProcessedAsync(employee.UserId.Value, appealDto)
+                    .ContinueWith(t =>
+                    {
+                        if (t.IsFaulted)
+                            _logger.LogWarning(t.Exception, "Notify appeal.processed failed for employee {EmployeeId}", appeal.EmployeeId);
+                    });
+            }
+
+            // Emit dashboard refresh
+            _ = _realtime.NotifyDashboardRefreshAsync(tenantId.Value)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                        _logger.LogWarning(t.Exception, "Notify dashboard.refresh failed for tenant {TenantId}", tenantId.Value);
+                });
+
+            return new TimesheetAppealDto
+            {
+                Id = appeal.Id,
+                EmployeeId = appeal.EmployeeId,
+                WorkDate = appeal.WorkDate,
+                AppealType = appeal.AppealType,
+                RequestedCheckIn = appeal.RequestedCheckIn,
+                RequestedCheckOut = appeal.RequestedCheckOut,
+                Reason = appeal.Reason,
+                AttachmentUrl = appeal.AttachmentUrl,
+                Status = appeal.Status,
+                ApprovedAt = appeal.ApprovedAt,
+                RejectReason = appeal.RejectReason
+            };
+        }
+
+        public async Task<List<TimesheetAppealDto>> GetPendingAppealsAsync()
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var appeals = await _appealRepository.GetPendingAsync(tenantId.Value);
+
+            var accessibleDeptIds = await _hrAuth.GetAccessibleDepartmentIdsAsync();
+            if (accessibleDeptIds != null)
+            {
+                appeals = appeals.Where(appeal => appeal.Employee != null && accessibleDeptIds.Contains(appeal.Employee.DepartmentId ?? Guid.Empty)).ToList();
+            }
+
+            return appeals.Select(appeal => new TimesheetAppealDto
+            {
+                Id = appeal.Id,
+                EmployeeId = appeal.EmployeeId,
+                WorkDate = appeal.WorkDate,
+                AppealType = appeal.AppealType,
+                RequestedCheckIn = appeal.RequestedCheckIn,
+                RequestedCheckOut = appeal.RequestedCheckOut,
+                Reason = appeal.Reason,
+                AttachmentUrl = appeal.AttachmentUrl,
+                Status = appeal.Status,
+                ApprovedAt = appeal.ApprovedAt,
+                RejectReason = appeal.RejectReason
+            }).OrderBy(x => x.WorkDate).ToList();
+        }
+
+        public async Task<AttendanceSettingDto> GetSettingsAsync()
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var setting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId.Value);
+
+            if (setting == null)
+            {
+                // Return default setting if not configured yet
+                return new AttendanceSettingDto
+                {
+                    TenantId = tenantId.Value,
+                    CheckInRadiusMeters = 100,
+                    DayStartCutOffTime = new TimeSpan(4, 0, 0),
+                    LateThresholdMinutes = 10,
+                    EarlyLeaveThresholdMinutes = 10,
+                    MinimumOTMinutes = 30,
+                    OTBlockMinutes = 30
+                };
+            }
+
+            return new AttendanceSettingDto
+            {
+                TenantId = setting.TenantId,
+                Latitude = setting.Latitude,
+                Longitude = setting.Longitude,
+                CheckInRadiusMeters = setting.CheckInRadiusMeters,
+                WorkStartTime = setting.WorkStartTime?.ToTimeSpan(),
+                WorkEndTime = setting.WorkEndTime?.ToTimeSpan(),
+                DayStartCutOffTime = setting.DayStartCutOffTime,
+                LateThresholdMinutes = setting.LateThresholdMinutes,
+                EarlyLeaveThresholdMinutes = setting.EarlyLeaveThresholdMinutes,
+                MinimumOTMinutes = setting.MinimumOTMinutes,
+                OTBlockMinutes = setting.OTBlockMinutes
+            };
+        }
+
+        public async Task<AttendanceSettingDto> UpdateSettingsAsync(UpdateAttendanceSettingRequestDto request)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var setting = await _attendanceSettingRepository.GetByTenantIdAsync(tenantId.Value);
+
+            if (setting == null)
+            {
+                setting = new SMEFLOWSystem.Core.Entities.TenantAttendanceSetting
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId.Value
+                };
+            }
+
+            setting.Latitude = request.Latitude;
+            setting.Longitude = request.Longitude;
+            setting.CheckInRadiusMeters = request.CheckInRadiusMeters;
+            setting.WorkStartTime = request.WorkStartTime.HasValue ? TimeOnly.FromTimeSpan(request.WorkStartTime.Value) : null;
+            setting.WorkEndTime = request.WorkEndTime.HasValue ? TimeOnly.FromTimeSpan(request.WorkEndTime.Value) : null;
+            setting.DayStartCutOffTime = request.DayStartCutOffTime;
+            setting.LateThresholdMinutes = request.LateThresholdMinutes;
+            setting.EarlyLeaveThresholdMinutes = request.EarlyLeaveThresholdMinutes;
+            setting.MinimumOTMinutes = request.MinimumOTMinutes;
+            setting.OTBlockMinutes = request.OTBlockMinutes;
+            setting.UpdatedAt = DateTime.UtcNow;
+
+            await _attendanceSettingRepository.UpsertAsync(setting);
+
+            return await GetSettingsAsync();
+        }
+
+        public async Task<List<HRMonthlyReportItemDto>> GetHRMonthlyReportAsync(int month, int year)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var timesheets = await _dailyTimesheetRepository.GetByTenantMonthAsync(tenantId.Value, month, year);
+
+            var accessibleDeptIds = await _hrAuth.GetAccessibleDepartmentIdsAsync();
+            if (accessibleDeptIds != null)
+            {
+                timesheets = timesheets.Where(t => t.Employee != null && accessibleDeptIds.Contains(t.Employee.DepartmentId ?? Guid.Empty)).ToList();
+            }
+
+            var report = timesheets.GroupBy(t => new { t.EmployeeId, t.Employee?.FullName })
+                .Select(g => new HRMonthlyReportItemDto
+                {
+                    EmployeeId = g.Key.EmployeeId,
+                    EmployeeName = g.Key.FullName ?? "Unknown",
+                    Month = month,
+                    Year = year,
+                    TotalWorkDays = g.Count(x => x.Status != StatusEnum.AttendanceAbsent && x.Status != StatusEnum.AttendanceOnLeave),
+                    TotalActualHours = g.Sum(x => x.ActualWorkHours),
+                    TotalOTHours = g.Sum(x => x.OTHours),
+                    TotalLateMinutes = g.Sum(x => x.TotalLateMinutes),
+                    TotalEarlyLeaveMinutes = g.Sum(x => x.TotalEarlyLeaveMinutes),
+                    MissingPunches = g.Count(x => x.Status == StatusEnum.AttendanceMissingOut)
+                })
+                .OrderBy(x => x.EmployeeName)
+                .ToList();
+
+            return report;
+        }
+
+        public async Task<PublicHolidayDto> CreatePublicHolidayAsync(CreatePublicHolidayDto dto)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var holiday = new PublicHoliday
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId.Value,
+                Date = dto.Date,
+                Name = dto.Name,
+                IsRecurringYearly = dto.IsRecurringYearly
+            };
+
+            await _publicHolidayRepository.AddAsync(holiday);
+
+            return new PublicHolidayDto
+            {
+                Id = holiday.Id,
+                TenantId = holiday.TenantId,
+                Date = holiday.Date,
+                Name = holiday.Name,
+                IsRecurringYearly = holiday.IsRecurringYearly
+            };
+        }
+
+        public async Task<List<PublicHolidayDto>> GetPublicHolidaysAsync()
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var holidays = await _publicHolidayRepository.GetAllAsync(tenantId.Value);
+
+            return holidays.Select(h => new PublicHolidayDto
+            {
+                Id = h.Id,
+                TenantId = h.TenantId,
+                Date = h.Date,
+                Name = h.Name,
+                IsRecurringYearly = h.IsRecurringYearly
+            }).ToList();
+        }
+
+        public async Task DeletePublicHolidayAsync(Guid id)
+        {
+            var tenantId = _currentTenantService.TenantId;
+            if (tenantId == null) throw new UnauthorizedAccessException("Tenant ID is missing.");
+
+            var holiday = await _publicHolidayRepository.GetByIdAsync(id);
+            if (holiday == null || holiday.TenantId != tenantId.Value)
+            {
+                throw new InvalidOperationException("Holiday not found or unauthorized.");
+            }
+
+            await _publicHolidayRepository.DeleteAsync(holiday);
+        }
+    }
+}

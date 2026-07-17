@@ -1,0 +1,66 @@
+using FluentValidation;
+using Microsoft.Extensions.DependencyInjection;
+using SMEFLOWSystem.Application.Interfaces.IRepositories;
+using SMEFLOWSystem.Application.Interfaces.IServices;
+using SMEFLOWSystem.Application.Mappings;
+using SMEFLOWSystem.Application.Services;
+using SMEFLOWSystem.Application.Services.System;
+using SMEFLOWSystem.Application.BackgroundJobs;
+using SMEFLOWSystem.Application.Validation.AuthValidation;
+using SMEFLOWSystem.Application.Validation.HRValidation;
+using Microsoft.Extensions.Configuration;
+using SMEFLOWSystem.Application.Interfaces.IServices.System;
+using VNPAY.NET;
+
+namespace SMEFLOWSystem.Application.Extensions;
+
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApplication(this IServiceCollection services)
+    {
+        services.AddAutoMapper(_ => { }, typeof(RoleMappingProfile).Assembly);
+
+        services.AddValidatorsFromAssemblyContaining<RegisterRequestDtoValidator>();
+
+        services.AddScoped<IAuthService, AuthService>();
+        services.AddScoped<IUserService, UserService>();
+        services.AddScoped<IRoleService, RoleService>();
+        services.AddScoped<IModuleService, ModuleService>();
+        services.AddScoped<IInviteService, InviteService>();
+        services.AddScoped<IModuleSubscriptionService, ModuleSubscriptionService>();
+        services.AddScoped<IBillingOrderModuleService, BillingOrderModuleService>();
+        services.AddScoped<IBillingOrderService, BillingOrderService>();
+        services.AddSingleton<IVnpay, Vnpay>();
+        services.AddScoped<IPaymentService, PaymentService>();
+        services.AddScoped<IPostPaymentSubscriptionService, PostPaymentSubscriptionService>();
+        services.AddScoped<IBillingService, BillingService>();
+        services.AddScoped<IOTPService, OTPService>();
+        services.AddScoped<IRefreshTokenService, RefreshTokenService>();
+        services.AddScoped<IHrDepartmentService, HrDepartmentService>();
+        services.AddScoped<IHrPositionService, HrPositionService>();
+        services.AddScoped<IHrEmployeeService, HrEmployeeService>();
+        services.AddScoped<IShiftManagementService, ShiftManagementService>();
+
+        // HR Authorization: Centralized scope service + Manager-Department assignment
+        services.AddScoped<IHrAuthorizationService, HrAuthorizationService>();
+        services.AddScoped<IManagerDepartmentService, ManagerDepartmentService>();
+        services.AddScoped<IManualTimesheetService, ManualTimesheetService>();
+
+        services.AddScoped<IAttendanceService, AttendanceService>();
+        services.AddScoped<IAttendanceResolutionService, AttendanceResolutionService>();
+        services.AddScoped<IPayrollService, PayrollService>();
+        services.AddScoped<IDashboardService, DashboardService>();
+        services.AddScoped<INotificationService, NotificationService>();
+        services.AddScoped<ILeaveRequestService, LeaveRequestService>();
+
+
+        services.AddScoped<TenantExpirationRecurringJob>();
+        services.AddScoped<PayrollRecurringJob>();
+        services.AddScoped<AttendanceResolutionRecurringJob>();
+
+        services.AddScoped<ISystemBootstrapService, SystemBootstrapService>();
+        services.AddScoped<ISystemTenantService, SystemTenantService>();
+        services.AddScoped<ISystemDashboardService, SystemDashboardService>();
+        return services;
+    }
+}

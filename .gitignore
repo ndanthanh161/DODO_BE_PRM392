@@ -1,0 +1,45 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+
+# Rider / IntelliJ
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated files
+*.cache
+*.g.cs
+*.generated.cs
+
+# Test results
+TestResults/
+
+# App settings
+**/appsettings.*.json
+!**/appsettings.json
+.env
+.env.*
+!.env.example
+backups/
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md

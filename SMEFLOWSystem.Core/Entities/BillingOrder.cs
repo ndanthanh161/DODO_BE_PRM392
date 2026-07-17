@@ -1,0 +1,35 @@
+using SMEFLOWSystem.SharedKernel.Interfaces;
+using System.Collections.Generic;
+
+namespace SMEFLOWSystem.Core.Entities;
+
+/// <summary>
+/// Hóa đơn gia hạn / mua thêm module của Tenant.
+/// </summary>
+public class BillingOrder : ITenantEntity
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public virtual Tenant? Tenant { get; set; }
+
+    public string BillingOrderNumber { get; set; } = string.Empty;
+    public Guid CustomerId { get; set; }
+
+    public DateTime BillingDate { get; set; }
+
+    public decimal TotalAmount { get; set; }
+    public decimal? DiscountAmount { get; set; }
+    public decimal? FinalAmount { get; set; }
+
+    public string PaymentStatus { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+
+    public string? Notes { get; set; }
+
+    public DateTime? CreatedAt { get; set; }
+    public DateTime? UpdatedAt { get; set; }
+
+    public bool? IsDeleted { get; set; }
+
+    public virtual ICollection<BillingOrderModule> BillingOrderModules { get; set; } = new List<BillingOrderModule>();
+}

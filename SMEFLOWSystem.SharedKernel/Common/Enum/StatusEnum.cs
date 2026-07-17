@@ -1,0 +1,78 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace ShareKernel.Common.Enum
+{
+    public static class StatusEnum
+    {
+        public const string TenantPending = "PendingPayment"; 
+        public const string TenantTrial = "Trial";            
+        public const string TenantActive = "Active";          
+        public const string TenantSuspended = "Suspended";    // Bị treo (hết hạn)
+
+        // Module Subscription Status 
+        public const string ModuleTrial = "Trial";
+        public const string ModuleActive = "Active";
+        public const string ModuleSuspended = "Suspended";
+
+        // Order Status
+        public const string OrderPending = "Pending";
+        public const string OrderPaid = "Paid";
+        public const string OrderCancelled = "Cancelled";
+        public const string OrderFailed = "Failed";
+        public const string OrderCompleted = "Completed";
+
+        // Payment Status 
+        public const string PaymentPending = "Pending";
+        public const string PaymentPaid = "Paid";
+        public const string PaymentFailed = "Failed";
+
+        // Employee Status 
+        public const string EmployeeWorking = "Working";
+        public const string EmployeeResigned = "Resigned";
+        public const string EmployeeOnLeave = "OnLeave";
+        public const string EmployeeProbation = "Probation";
+
+        // Attendance status
+        public const string AttendancePresent = "Present";
+        public const string AttendanceLate = "Late";
+        public const string AttendanceEarlyLeave = "EarlyLeave";
+        public const string AttendanceAbsent = "Absent";
+        public const string AttendanceMissingOut = "MissingOut";
+        public const string AttendanceOnLeave = "OnLeave";
+        public const string AttendanceNoShift = "NoShift";
+        public const string AttendanceNormal = "Normal";
+        public const string AttendanceHoliday = "Holiday";
+
+        // Approval status
+        public const string ApprovalPending = "PendingApproval";
+        public const string ApprovalApproved = "Approved";
+        public const string ApprovalRejected = "Rejected";
+
+        //Leave Request Status
+        public const string LeaveRequestPending = "Pending";
+        public const string LeaveRequestApproved = "Approved";
+        public const string LeaveRequestRejected = "Rejected";
+        public const string LeaveRequestCancelled = "Cancelled";
+        // Outbox Message Status
+        public const string OutboxPending = "Pending";
+        public const string OutboxProcessed = "Processed";
+        public const string OutboxFailed = "Failed";
+        public const string OutboxProcessing = "Processing";
+
+        //PunchKind
+        public const string PunchIn = "In";
+        public const string PunchOut = "Out";
+
+        // Email Template Types
+        public const string EmailTypeNew = "NEW";
+        public const string EmailTypeAdditional = "ADDITIONAL";
+        public const string EmailTypeRenewal = "RENEWAL";
+        public const string EmailTypeTrialOptional = "TRIAL_OPTIONAL";
+
+
+    }
+}
