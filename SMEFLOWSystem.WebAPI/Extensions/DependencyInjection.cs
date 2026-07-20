@@ -86,6 +86,7 @@ public static class DependencyInjection
         });
 
         services.AddHttpContextAccessor();
+        services.AddSingleton<IFirebaseTokenVerifier, FirebaseTokenVerifier>();
         services.AddAuthorization(options =>
         {
             options.AddPolicy(PolicyNames.TenantAdmin, policy =>

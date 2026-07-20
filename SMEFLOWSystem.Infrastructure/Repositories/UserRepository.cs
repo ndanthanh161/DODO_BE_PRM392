@@ -61,10 +61,14 @@ namespace SMEFLOWSystem.Infrastructure.Repositories
 
         public async Task<User?> GetUserByEmailAsync(string email)
         {
+            var normalizedEmail = NormalizeEmail(email);
+            if (string.IsNullOrWhiteSpace(normalizedEmail)) return null;
+
             var user = await _context.Users
                 .IgnoreQueryFilters()
                 .Include(x => x.Tenant)
-                .FirstOrDefaultAsync(u => u.Email == email);
+                .FirstOrDefaultAsync(u =>
+                    u.Email != null && u.Email.ToLower() == normalizedEmail);
 
             if (user != null)
             {
