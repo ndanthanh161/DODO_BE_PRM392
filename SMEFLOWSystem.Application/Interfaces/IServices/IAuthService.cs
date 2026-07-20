@@ -12,6 +12,7 @@ namespace SMEFLOWSystem.Application.Interfaces.IServices
     {
         Task<bool> RegisterTenantAsync(RegisterRequestDto request);
         Task<LoginUserDto> LoginAsync(LoginRequestDto request);
+        Task<LoginUserDto> LoginWithFirebaseAsync(string idToken);
         Task<(bool,string)> ChangePasswordAsync(Guid id, ChangePasswordRequestDto request);
     }
 }

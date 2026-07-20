@@ -22,6 +22,7 @@ namespace SMEFLOWSystem.Application.Services
     {
         private readonly ITenantRepository _tenantRepo;
         private readonly IUserRepository _userRepo;
+        private readonly IEmployeeRepository _employeeRepo;
         private readonly IRoleRepository _roleRepo;
         private readonly IUserRoleRepository _userRoleRepo;
         private readonly ICustomerRepository _customerRepo;
@@ -33,11 +34,13 @@ namespace SMEFLOWSystem.Application.Services
         private readonly IBillingService _billingService;
         private readonly IMapper _mapper;
         private readonly IRefreshTokenService _refreshTokenService;
+        private readonly IFirebaseTokenVerifier _firebaseTokenVerifier;
 
         // Constructor Injection
         public AuthService(
             ITenantRepository tenantRepo,
             IUserRepository userRepo,
+            IEmployeeRepository employeeRepo,
             IRoleRepository roleRepo,
             IUserRoleRepository userRoleRepo,
             ICustomerRepository customerRepo,
@@ -48,10 +51,12 @@ namespace SMEFLOWSystem.Application.Services
             IBillingOrderService billingOrderService,
             IBillingService billingService,
             IMapper mapper,
-            IRefreshTokenService refreshTokenService)
+            IRefreshTokenService refreshTokenService,
+            IFirebaseTokenVerifier firebaseTokenVerifier)
         {
             _tenantRepo = tenantRepo;
             _userRepo = userRepo;
+            _employeeRepo = employeeRepo;
             _roleRepo = roleRepo;
             _userRoleRepo = userRoleRepo;
             _customerRepo = customerRepo;
@@ -63,6 +68,7 @@ namespace SMEFLOWSystem.Application.Services
             _billingService = billingService;
             _mapper = mapper;
             _refreshTokenService = refreshTokenService;
+            _firebaseTokenVerifier = firebaseTokenVerifier;
         }
 
         public async Task<bool> RegisterTenantAsync(RegisterRequestDto request)
@@ -125,6 +131,26 @@ namespace SMEFLOWSystem.Application.Services
                 };
 
                 await _userRoleRepo.AddUserRoleAsync(userRole);
+
+                // The mobile app is employee-centric (attendance, personal
+                // dashboard and payroll). Link the tenant owner to an employee
+                // profile immediately so the first account can use those
+                // features without a manual database backfill.
+                var adminEmployee = new Employee
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = newTenant.Id,
+                    UserId = adminUser.Id,
+                    FullName = request.AdminFullName,
+                    Phone = request.PhoneNumber ?? string.Empty,
+                    Email = request.AdminEmail,
+                    HireDate = DateOnly.FromDateTime(now),
+                    BaseSalary = 0,
+                    Status = StatusEnum.EmployeeWorking,
+                    CreatedAt = now,
+                    IsDeleted = false
+                };
+                await _employeeRepo.AddAsync(adminEmployee);
 
                 var internalCustomer = new Customer
                 {
@@ -189,6 +215,31 @@ namespace SMEFLOWSystem.Application.Services
 
             if (!user.IsActive)
                 throw new Exception("Tài khoản của bạn đã bị khóa.");
+
+            if (user.IsDeleted)
+                throw new Exception("Tài khoản của bạn không còn hoạt động.");
+
+            return await CreateLoginResultAsync(user);
+        }
+
+        public async Task<LoginUserDto> LoginWithFirebaseAsync(string idToken)
+        {
+            var identity = await _firebaseTokenVerifier.VerifyAsync(idToken);
+            var user = await _userRepo.GetUserByEmailAsync(identity.Email);
+
+            if (user == null)
+                throw new UnauthorizedAccessException(
+                    "Tài khoản Firebase chưa được liên kết với DodoSystem.");
+
+            if (!user.IsActive || user.IsDeleted)
+                throw new UnauthorizedAccessException(
+                    "Tài khoản đã bị khóa hoặc không còn hoạt động.");
+
+            return await CreateLoginResultAsync(user);
+        }
+
+        private async Task<LoginUserDto> CreateLoginResultAsync(User user)
+        {
 
             var tenant = user.Tenant;
             if (tenant == null) throw new Exception("Không tìm thấy tenant");

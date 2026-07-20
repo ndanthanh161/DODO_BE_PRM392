@@ -55,6 +55,36 @@ namespace SMEFLOWSystem.WebAPI.Controllers
             }
         }
 
+        /// <summary>Đổi Firebase ID token hợp lệ thành JWT của DodoSystem</summary>
+        [HttpPost("firebase-login")]
+        [AllowAnonymous]
+        public async Task<IActionResult> FirebaseLogin(
+            [FromBody] FirebaseLoginRequestDto request)
+        {
+            if (string.IsNullOrWhiteSpace(request.IdToken))
+                return BadRequest(new { Error = "Thiếu Firebase ID token." });
+
+            try
+            {
+                var user = await _authService.LoginWithFirebaseAsync(request.IdToken);
+                return Ok(user);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                return Unauthorized(new { Error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return StatusCode(
+                    StatusCodes.Status503ServiceUnavailable,
+                    new { Error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new { Error = ex.Message });
+            }
+        }
+
         /// <summary>Đổi mật khẩu (dành cho user đã đăng nhập)</summary>
         [HttpPost("change-password")]
         [Authorize]

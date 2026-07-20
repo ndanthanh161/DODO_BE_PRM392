@@ -40,6 +40,8 @@ TestResults/
 .env.*
 !.env.example
 backups/
+secrets/
+*firebase-service-account*.json
 
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md

@@ -143,6 +143,12 @@ services:
     cpus: 1.00
     security_opt:
       - no-new-privileges:true
+    secrets:
+      - firebase_service_account
+
+secrets:
+  firebase_service_account:
+    file: ${FIREBASE_CREDENTIALS_PATH}
 
 volumes:
   postgres_data:
