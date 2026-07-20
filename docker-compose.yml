@@ -2,15 +2,28 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: dodo-postgres
-    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=30", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=32MB"]
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=30
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - dodo_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 10s
       timeout: 5s
       retries: 10
@@ -25,11 +38,23 @@ services:
   redis:
     image: redis:7-alpine
     container_name: dodo-redis
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "48mb", "--maxmemory-policy", "noeviction"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 48mb
+      - --maxmemory-policy
+      - noeviction
     volumes:
       - redis_data:/data
+    networks:
+      - dodo_net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD
+        - redis-cli
+        - ping
       interval: 10s
       timeout: 3s
       retries: 10
@@ -48,8 +73,14 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
       - ./rabbitmq.conf:/etc/rabbitmq/conf.d/99-dodo.conf:ro
+    networks:
+      - dodo_net
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test:
+        - CMD
+        - rabbitmq-diagnostics
+        - -q
+        - ping
       interval: 15s
       timeout: 5s
       retries: 10
@@ -61,21 +92,37 @@ services:
       - no-new-privileges:true
 
   webapi:
-    image: ghcr.io/${GHCR_OWNER}/dodosystem-api:${IMAGE_TAG:-latest}
+    image: ghcr.io/${GHCR_OWNER}/dodosystem-api:${IMAGE_TAG}
     container_name: dodo-webapi
     env_file:
       - .env
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ASPNETCORE_URLS: http://+:8080
-      ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};Pooling=true;Minimum Pool Size=0;Maximum Pool Size=15;Timeout=15;Command Timeout=30
+
+      ConnectionStrings__DefaultConnection: >-
+        Host=postgres;
+        Port=5432;
+        Database=${POSTGRES_DB};
+        Username=${POSTGRES_USER};
+        Password=${POSTGRES_PASSWORD};
+        Pooling=true;
+        Minimum Pool Size=0;
+        Maximum Pool Size=15;
+        Timeout=15;
+        Command Timeout=30
+
       ConnectionStrings__Redis: redis:6379,abortConnect=false
+
       RabbitMQ__Host: rabbitmq
       RabbitMQ__Port: 5672
       RabbitMQ__Username: ${RABBITMQ_USER}
       RabbitMQ__Password: ${RABBITMQ_PASSWORD}
+
     ports:
       - "127.0.0.1:8085:8080"
+    networks:
+      - dodo_net
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,7 +131,9 @@ services:
       rabbitmq:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1
       interval: 30s
       timeout: 5s
       retries: 5
@@ -99,3 +148,11 @@ volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
+
+networks:
+  dodo_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
