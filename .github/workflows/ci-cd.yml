@@ -2,9 +2,11 @@ name: Build and deploy production
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -17,11 +19,14 @@ concurrency:
 
 jobs:
   build-test:
+    name: Build and test
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Setup .NET
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
@@ -33,24 +38,36 @@ jobs:
         run: dotnet build SMEFLOWSystem.sln -c Release --no-restore
 
       - name: Test
-        run: dotnet test SMEFLOWSystem.sln -c Release --no-build --verbosity normal
+        run: dotnet test SMEFLOWSystem.sln -c Release --no-build --no-restore --verbosity normal
 
   build-push-image:
-    needs: build-test
+    name: Build and push Docker image
+    needs:
+      - build-test
+
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       image_name: ${{ steps.meta.outputs.image_name }}
       owner_lower: ${{ steps.meta.outputs.owner_lower }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Set image metadata
         id: meta
         shell: bash
         run: |
-          OWNER_LOWER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          set -Eeuo pipefail
+
+          OWNER_LOWER="$(
+            echo "${GITHUB_REPOSITORY_OWNER}" |
+            tr '[:upper:]' '[:lower:]'
+          )"
+
           echo "owner_lower=${OWNER_LOWER}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           echo "image_name=ghcr.io/${OWNER_LOWER}/dodosystem-api" >> "$GITHUB_OUTPUT"
@@ -62,19 +79,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: SMEFLOWSystem.WebAPI/Dockerfile
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}
             ${{ steps.meta.outputs.image_name }}:latest
 
-    deploy:
-    needs: build-push-image
-    if: github.ref == 'refs/heads/main'
+  deploy:
+    name: Deploy to EC2
+    needs:
+      - build-push-image
+
+    if: >
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
+
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -89,6 +116,11 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
           PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
         run: |
+          set -Eeuo pipefail
+
+          test -n "$PROD_SSH_KEY"
+          test -n "$PROD_KNOWN_HOSTS"
+
           install -m 700 -d "$HOME/.ssh"
 
           printf '%s\n' "$PROD_SSH_KEY" \
@@ -106,8 +138,16 @@ jobs:
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_USER: ${{ secrets.PROD_USER }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ needs.build-push-image.outputs.image_tag }}
         run: |
+          set -Eeuo pipefail
+
+          test -n "$PROD_HOST"
+          test -n "$PROD_USER"
+          test -n "$IMAGE_TAG"
+
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
+
           ssh \
             -i "$HOME/.ssh/id_ed25519" \
             -o BatchMode=yes \
@@ -121,10 +161,16 @@ jobs:
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
         run: |
+          set -Eeuo pipefail
+
           curl \
             --fail \
             --show-error \
+            --silent \
             --retry 12 \
             --retry-delay 5 \
             --retry-connrefused \
             "https://${PROD_HOST}/health"
+
+          echo
+          echo "Production health check passed."
