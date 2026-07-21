@@ -72,19 +72,59 @@ jobs:
             ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}
             ${{ steps.meta.outputs.image_name }}:latest
 
-  deploy:
+    deploy:
     needs: build-push-image
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
+    timeout-minutes: 10
+
+    concurrency:
+      group: dodo-production-deploy
+      cancel-in-progress: false
+
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.PROD_HOST }}
-          username: ${{ secrets.PROD_USER }}
-          key: ${{ secrets.PROD_SSH_KEY }}
-          script_stop: true
-          script: |
-            cd /opt/dodo
-            ./deploy.sh "${{ needs.build-push-image.outputs.image_tag }}"
+      - name: Configure verified SSH
+        shell: bash
+        env:
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+
+          printf '%s\n' "$PROD_SSH_KEY" \
+            > "$HOME/.ssh/id_ed25519"
+
+          printf '%s\n' "$PROD_KNOWN_HOSTS" \
+            > "$HOME/.ssh/known_hosts"
+
+          chmod 600 \
+            "$HOME/.ssh/id_ed25519" \
+            "$HOME/.ssh/known_hosts"
+
+      - name: Deploy exact commit SHA
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            "${PROD_USER}@${PROD_HOST}" \
+            "deploy ${IMAGE_TAG}"
+
+      - name: Verify public HTTPS health
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          curl \
+            --fail \
+            --show-error \
+            --retry 12 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            "https://${PROD_HOST}/health"
